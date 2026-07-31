@@ -8,7 +8,6 @@ build/
 .venv/
 .docs-venv/
 venv/
-.env
 .deploy.env
 quick_start_draft.md
 scripts/quickstart/env
@@ -87,3 +86,4 @@ docs/superpowers/
 
 # MkDocs build output
 site/
+config.bat
