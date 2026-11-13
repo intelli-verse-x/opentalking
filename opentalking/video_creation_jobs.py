@@ -241,8 +241,13 @@ class VideoCreationJobManager:
             self.jobs.pop(job_id, None)
 
     async def close(self) -> None:
-        jobs = tuple(self.jobs)
-        for job_id in jobs:
-            job = self.jobs.get(job_id)
-            if job is not None and job.task is not None and not job.task.done():
+        errors: list[BaseException] = []
+        for job_id in tuple(self.jobs):
+            try:
                 await self.stop(job_id)
+            except KeyError:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]

@@ -347,8 +347,13 @@ class ChunkedRTMPSJobManager:
             self.jobs.pop(job_id, None)
 
     async def close(self) -> None:
+        errors: list[BaseException] = []
         for job_id in tuple(self.jobs):
             try:
                 await self.delete(job_id)
             except KeyError:
                 pass
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
