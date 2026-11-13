@@ -2789,15 +2789,23 @@ async def test_chunked_video_does_not_send_eof_before_mp4_export_succeeds(
         async def fail(self, code: str, _detail: str = "") -> None:
             self.failures.append(code)
 
+    archive_writers = []
+
     class FakeArchiveWriter:
         def __init__(self, _path: Path, *, fps: float) -> None:
             del fps
+            self.finalized = False
+            self.released = False
+            archive_writers.append(self)
 
         def write(self, _frame: np.ndarray) -> None:
             return None
 
         def close(self) -> None:
-            return None
+            self.finalized = True
+
+        def abort(self) -> None:
+            self.released = True
 
     async def failing_mux(_bin: str, _video: Path, _audio: Path, _output: Path) -> None:
         raise RuntimeError("mux failed")
@@ -2817,6 +2825,8 @@ async def test_chunked_video_does_not_send_eof_before_mp4_export_succeeds(
             chunk_sink=sink,  # type: ignore[arg-type]
         )
 
+    assert len(archive_writers) == 1
+    assert archive_writers[0].finalized and archive_writers[0].released
     assert sink.published > 0
     assert sink.finished is False
     assert sink.failures == ["video_export_failed"]
