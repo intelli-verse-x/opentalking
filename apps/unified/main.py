@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -19,11 +20,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apps.api.core.config import get_settings
 from apps.api.routes.avatars import _call_adapter_warmup
-from apps.api.routes import agent, avatars, events, exports, health, memory, models, personas, runtime_config, scene_assets, sessions, tts_preview, video_clone, video_creation, voices
+from apps.api.routes import agent, avatars, events, exports, health, hls_proxy, memory, models, outputs, personas, rtmps_jobs, runtime_config, scene_assets, sessions, tts_preview, video_clone, video_creation, voices
 from opentalking.voice.store import init_voice_store
 from opentalking.core.in_memory_redis import InMemoryRedis
 from opentalking.pipeline.session.runner import SessionRunner
 from opentalking.runtime.task_consumer import consume_task_queue
+from opentalking.video_creation_jobs import VideoCreationJobManager
+from opentalking.streaming.rtmps_jobs import ChunkedRTMPSJobManager
 
 log = logging.getLogger(__name__)
 
@@ -128,12 +131,15 @@ async def unified_lifespan(app: FastAPI):
     init_voice_store()
     settings = get_settings()
     app.state.settings = settings
+    app.state.video_creation_jobs = VideoCreationJobManager(settings)
+    app.state.rtmps_video_jobs = ChunkedRTMPSJobManager(settings, app.state.video_creation_jobs)
     log.info(
         "Unified: single HTTP worker required (in-memory session + task queue + runners). "
         "Do not use gunicorn/uvicorn --workers>1; do not load-balance multiple unified instances without sticky routing."
     )
     mem = InMemoryRedis()
     app.state.redis = mem
+    app.state.worker_boot_id = uuid.uuid4().hex
     runners: dict[str, SessionRunner] = {}
     app.state.session_runners = runners
     avatars_root = Path(
@@ -148,62 +154,84 @@ async def unified_lifespan(app: FastAPI):
         avatars_root,
         device,
     )
-    await _prewarm_local_stt_on_startup()
-
-    # Optional: warm one or more avatar Workers at startup so the very first
-    # session doesn't pay the 30-120s ``_build_fast_restore_contexts`` cost.
-    # Set ``OPENTALKING_PREWARM_AVATARS=quicktalk-daytime,...`` to a comma
-    # separated list of avatar IDs (under ``avatars_root``). Use
-    # ``OPENTALKING_PREWARM_MODEL=quicktalk`` when the selected runtime model is
-    # intentionally different from the avatar manifest's suggested model.
-    prewarm_raw = os.environ.get("OPENTALKING_PREWARM_AVATARS", "").strip()
-    if prewarm_raw:
-        prewarm_ids = [s.strip() for s in prewarm_raw.split(",") if s.strip()]
-        prewarm_model = os.environ.get("OPENTALKING_PREWARM_MODEL", "").strip().lower()
-
-        async def _prewarm() -> None:
-            from opentalking.avatar.loader import load_avatar_bundle
-            from opentalking.models.registry import get_adapter
-
-            for aid in prewarm_ids:
-                try:
-                    bundle = load_avatar_bundle(avatars_root / aid, strict=False)
-                except Exception:  # noqa: BLE001
-                    log.warning("prewarm: avatar %s not found, skipping", aid, exc_info=True)
-                    continue
-                model_type = prewarm_model or bundle.manifest.model_type
-                try:
-                    adapter = get_adapter(model_type)
-                except Exception:  # noqa: BLE001
-                    log.warning("prewarm: adapter for %s unavailable", model_type, exc_info=True)
-                    continue
-
-                def _do_prewarm(adapter=adapter, aid=aid, model_type=model_type) -> None:
-                    log.info("prewarm: building worker for avatar=%s model=%s", aid, model_type)
-                    if hasattr(adapter, "load_model"):
-                        adapter.load_model(_adapter_device(model_type, device))
-                    state = adapter.load_avatar(str(avatars_root / aid))
-                    _call_adapter_warmup(adapter, state)
-                    log.info("prewarm: ready avatar=%s fps=%s", aid, getattr(state, "fps", None))
-
-                loop = asyncio.get_running_loop()
-                try:
-                    await loop.run_in_executor(None, _do_prewarm)
-                except Exception:  # noqa: BLE001
-                    log.warning("prewarm failed for avatar=%s", aid, exc_info=True)
-
-        asyncio.create_task(_prewarm())
-
-    yield
-    consumer.cancel()
+    prewarm_task: asyncio.Task[None] | None = None
     try:
-        await consumer
-    except asyncio.CancelledError:
-        pass
-    for s in list(runners.values()):
-        await s.close()
-    runners.clear()
-    await mem.aclose()
+        await _prewarm_local_stt_on_startup()
+
+        # Optional: warm one or more avatar Workers at startup so the very first
+        # session doesn't pay the 30-120s ``_build_fast_restore_contexts`` cost.
+        # Set ``OPENTALKING_PREWARM_AVATARS=quicktalk-daytime,...`` to a comma
+        # separated list of avatar IDs (under ``avatars_root``). Use
+        # ``OPENTALKING_PREWARM_MODEL=quicktalk`` when the selected runtime model is
+        # intentionally different from the avatar manifest's suggested model.
+        prewarm_raw = os.environ.get("OPENTALKING_PREWARM_AVATARS", "").strip()
+        if prewarm_raw:
+            prewarm_ids = [s.strip() for s in prewarm_raw.split(",") if s.strip()]
+            prewarm_model = os.environ.get("OPENTALKING_PREWARM_MODEL", "").strip().lower()
+
+            async def _prewarm() -> None:
+                from opentalking.avatar.loader import load_avatar_bundle
+                from opentalking.models.registry import get_adapter
+
+                for aid in prewarm_ids:
+                    try:
+                        bundle = load_avatar_bundle(avatars_root / aid, strict=False)
+                    except Exception:  # noqa: BLE001
+                        log.warning("prewarm: avatar %s not found, skipping", aid, exc_info=True)
+                        continue
+                    model_type = prewarm_model or bundle.manifest.model_type
+                    try:
+                        adapter = get_adapter(model_type)
+                    except Exception:  # noqa: BLE001
+                        log.warning("prewarm: adapter for %s unavailable", model_type, exc_info=True)
+                        continue
+
+                    def _do_prewarm(adapter=adapter, aid=aid, model_type=model_type) -> None:
+                        log.info("prewarm: building worker for avatar=%s model=%s", aid, model_type)
+                        if hasattr(adapter, "load_model"):
+                            adapter.load_model(_adapter_device(model_type, device))
+                        state = adapter.load_avatar(str(avatars_root / aid))
+                        _call_adapter_warmup(adapter, state)
+                        log.info("prewarm: ready avatar=%s fps=%s", aid, getattr(state, "fps", None))
+
+                    loop = asyncio.get_running_loop()
+                    try:
+                        await loop.run_in_executor(None, _do_prewarm)
+                    except Exception:  # noqa: BLE001
+                        log.warning("prewarm failed for avatar=%s", aid, exc_info=True)
+
+            prewarm_task = asyncio.create_task(_prewarm())
+        yield
+    finally:
+        errors: list[BaseException] = []
+        for task in (prewarm_task, consumer):
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+        # Stop external publishers before their chunk sources, then sessions.
+        resources = (
+            app.state.rtmps_video_jobs,
+            app.state.video_creation_jobs,
+            *tuple(runners.values()),
+        )
+        runners.clear()
+        for resource in resources:
+            try:
+                await resource.close()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            await mem.aclose()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
 def create_app() -> FastAPI:
@@ -225,6 +253,7 @@ def create_app() -> FastAPI:
     app.include_router(avatars.router)
     app.include_router(memory.router)
     app.include_router(sessions.router)
+    app.include_router(outputs.router)
     app.include_router(agent.router)
     app.include_router(agent.router, prefix="/api")
     app.include_router(personas.router)
@@ -235,6 +264,8 @@ def create_app() -> FastAPI:
     app.include_router(tts_preview.router)
     app.include_router(video_clone.router)
     app.include_router(video_creation.router)
+    app.include_router(rtmps_jobs.router)
+    app.include_router(hls_proxy.router)
     app.include_router(voices.router)
     _verify_offline_bundle_route_registered(app)
     return app
