@@ -144,3 +144,5 @@ A source waiting for its first RTMPS publisher expires after 120 seconds by defa
 The local POSIX harness writes credentials to a private temporary file before atomic replacement, and refuses unsupported Windows persistence. Existing symlink targets are not overwritten. Do not use the isolated test profile, test CA or credentials in production.
 
 **Draft merge gate:** background knowledge-job recovery is not yet accepted. The current destructive queue pop, 24-hour queued marker and one-time recovery scan can strand interrupted work; extraction/enrichment recovery and active-worker ownership need an acknowledgement/lease design with bounded retries and crash tests. Do not treat successful build/tests as proof of durable ingestion, upstream-sync completion or production readiness.
+
+The RTSP capture helper decodes/re-encodes media and constructs a monotonic output clock. `ffprobe` checks on that capture describe the reconstructed recording; they do not prove that original wire timestamps never regressed. Real transport continuity and latency/jitter acceptance require raw receiver measurements and a rehearsed deployment.
