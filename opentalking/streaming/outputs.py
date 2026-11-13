@@ -666,15 +666,26 @@ class SessionOutputController:
         if duplicate is not None:
             return duplicate
         current = self._connect_tasks.get(output_id)
-        if current is not None and not current.done():
+        if current is not None and not current.done() and action != "disconnect":
             return record
-        if action == "disconnect" and record.connection_state in {
+        if action == "disconnect" and (current is None or current.done()) and record.connection_state in {
             OutputConnectionState.DISCONNECTED,
             OutputConnectionState.CREATED,
         }:
             return record
+        async def apply_lifecycle() -> OutputRecord:
+            if action == "disconnect":
+                # A stop must preempt an in-flight handshake/reconnect. Wait
+                # for its cancellation before closing the publisher so it
+                # cannot attach a branch after the disconnect has completed.
+                if current is not None and not current.done():
+                    current.cancel()
+                    await asyncio.gather(current, return_exceptions=True)
+                return await self.disconnect(output_id)
+            return await self.reconnect(output_id)
+
         task = asyncio.create_task(
-            self.disconnect(output_id) if action == "disconnect" else self.reconnect(output_id),
+            apply_lifecycle(),
             name=f"output-{action}-{output_id}",
         )
         self._connect_tasks[output_id] = task

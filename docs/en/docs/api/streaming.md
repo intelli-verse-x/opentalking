@@ -134,3 +134,13 @@ docker compose -f docker/docker-compose.streaming-test.yml down -v
 ```
 
 The receiver scripts read temporary credentials from `OPENTALKING_HARNESS_READ_USERNAME`, `OPENTALKING_HARNESS_READ_PASSWORD`, and `OPENTALKING_HARNESS_WHEP_TOKEN`; do not embed credentials in URLs or command lines. Test credentials, private keys, captures, and `.env` files must not be committed.
+
+## Fork candidate review and cancellation boundaries
+
+The reviewed fork candidate scopes HLS reader credentials to the selected media origin and binds WHEP cleanup to the original session token and same HTTPS origin. Publication polling requires both source and publisher completion plus an export; Stop attempts both jobs independently. These are source and synthetic-test checks, not a real-browser, provider, GPU or media-playback acceptance.
+
+A source waiting for its first RTMPS publisher expires after 120 seconds by default. Set `OPENTALKING_VIDEO_CREATION_PUBLISH_GATE_TIMEOUT_SEC` to a finite positive number at most 3600. Expiry fails the source without starting its renderer and releases job-owned uploaded/emotion temporary files. Cancellation releases incremental archive writers, including partial/zero-frame archives. A lost response after an external publisher actually starts still requires operator status reconciliation; browser cancellation is not a distributed transaction or proof that remote publication stopped.
+
+The local POSIX harness writes credentials to a private temporary file before atomic replacement, and refuses unsupported Windows persistence. Existing symlink targets are not overwritten. Do not use the isolated test profile, test CA or credentials in production.
+
+**Draft merge gate:** background knowledge-job recovery is not yet accepted. The current destructive queue pop, 24-hour queued marker and one-time recovery scan can strand interrupted work; extraction/enrichment recovery and active-worker ownership need an acknowledgement/lease design with bounded retries and crash tests. Do not treat successful build/tests as proof of durable ingestion, upstream-sync completion or production readiness.

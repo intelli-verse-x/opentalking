@@ -44,19 +44,40 @@ async def lifespan(app: FastAPI):
     device = os.environ.get("OPENTALKING_TORCH_DEVICE", "cuda")
     app.state.device = device
     consumer = asyncio.create_task(consume_task_queue(r, avatars, device, runners))
-    yield
-    consumer.cancel()
     try:
-        await consumer
-    except asyncio.CancelledError:
-        pass
-    for s in list(runners.values()):
-        controller = output_controllers.pop(getattr(s, "session_id", ""), None)
-        if controller is not None:
-            await controller.close()
-        await s.close()
-    runners.clear()
-    await r.aclose()
+        yield
+    finally:
+        errors: list[BaseException] = []
+        consumer.cancel()
+        try:
+            await consumer
+        except asyncio.CancelledError:
+            pass
+        except BaseException as exc:
+            errors.append(exc)
+        # Snapshot-only controllers may have no corresponding live runner.
+        # Close every external output before its source and Redis, and keep
+        # attempting cleanup after any individual resource fails.
+        controllers = tuple(output_controllers.values())
+        output_controllers.clear()
+        for controller in controllers:
+            try:
+                await controller.close()
+            except BaseException as exc:
+                errors.append(exc)
+        sources = tuple(runners.values())
+        runners.clear()
+        for source in sources:
+            try:
+                await source.close()
+            except BaseException as exc:
+                errors.append(exc)
+        try:
+            await r.aclose()
+        except BaseException as exc:
+            errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
 def create_app() -> FastAPI:

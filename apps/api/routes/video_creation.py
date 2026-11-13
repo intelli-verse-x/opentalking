@@ -188,70 +188,79 @@ async def create_video_creation_job(
                 upload_path = None
             emotion_path_for_job = emotion_audio_path
 
-            async def run_async_job(sink: object) -> dict[str, Any]:
+            def cleanup_async_job() -> None:
+                # The manager owns these files even if cancellation happens
+                # before the runner starts or while it waits for a publisher.
                 try:
-                    if source == "upload":
-                        assert upload_path is not None
-                        return await service.create_from_audio_file(
-                            model=model,
-                            avatar_id=avatar_id,
-                            upload_path=upload_path,
-                            title=title,
-                            mime_type=audio_file.content_type if audio_file is not None else None,
-                            fasterliveportrait_config=flp_config,
-                            composition_config=video_composition_config,
-                            light2d_renderer=light2d_renderer,
-                            chunk_sink=sink,  # type: ignore[arg-type]
-                        )
-                    if source == "reference_video":
-                        return await service.create_reference_video(
-                            model=model,
-                            avatar_id=avatar_id,
-                            duration_sec=duration_sec,
-                            title=title,
-                            composition_config=video_composition_config,
-                            light2d_renderer=light2d_renderer,
-                            chunk_sink=sink,  # type: ignore[arg-type]
-                        )
-                    if source == "duo_dialog":
-                        return await service.create_from_duo_dialog(
-                            model=model,
-                            avatar_id=avatar_id,
-                            title=title,
-                            duo_dialog=_parse_duo_dialog(duo_dialog),
-                            tts_provider=tts_provider,
-                            tts_model=tts_model,
-                            indextts_config=index_config,
-                            composition_config=video_composition_config,
-                            chunk_sink=sink,  # type: ignore[arg-type]
-                        )
-                    return await service.create_from_tts_text(
+                    if upload_path is not None:
+                        upload_path.unlink(missing_ok=True)
+                finally:
+                    if emotion_path_for_job is not None:
+                        emotion_path_for_job.unlink(missing_ok=True)
+
+            async def run_async_job(sink: object) -> dict[str, Any]:
+                if source == "upload":
+                    assert upload_path is not None
+                    return await service.create_from_audio_file(
                         model=model,
                         avatar_id=avatar_id,
-                        text=text or "",
+                        upload_path=upload_path,
                         title=title,
-                        tts_provider=tts_provider,
-                        tts_model=tts_model,
-                        voice=voice,
-                        source=source,
+                        mime_type=audio_file.content_type if audio_file is not None else None,
                         fasterliveportrait_config=flp_config,
-                        indextts_config=index_config,
                         composition_config=video_composition_config,
                         light2d_renderer=light2d_renderer,
                         chunk_sink=sink,  # type: ignore[arg-type]
                     )
-                finally:
-                    if upload_path is not None:
-                        upload_path.unlink(missing_ok=True)
-                    if emotion_path_for_job is not None:
-                        emotion_path_for_job.unlink(missing_ok=True)
+                if source == "reference_video":
+                    return await service.create_reference_video(
+                        model=model,
+                        avatar_id=avatar_id,
+                        duration_sec=duration_sec,
+                        title=title,
+                        composition_config=video_composition_config,
+                        light2d_renderer=light2d_renderer,
+                        chunk_sink=sink,  # type: ignore[arg-type]
+                    )
+                if source == "duo_dialog":
+                    return await service.create_from_duo_dialog(
+                        model=model,
+                        avatar_id=avatar_id,
+                        title=title,
+                        duo_dialog=_parse_duo_dialog(duo_dialog),
+                        tts_provider=tts_provider,
+                        tts_model=tts_model,
+                        indextts_config=index_config,
+                        composition_config=video_composition_config,
+                        chunk_sink=sink,  # type: ignore[arg-type]
+                    )
+                return await service.create_from_tts_text(
+                    model=model,
+                    avatar_id=avatar_id,
+                    text=text or "",
+                    title=title,
+                    tts_provider=tts_provider,
+                    tts_model=tts_model,
+                    voice=voice,
+                    source=source,
+                    fasterliveportrait_config=flp_config,
+                    indextts_config=index_config,
+                    composition_config=video_composition_config,
+                    light2d_renderer=light2d_renderer,
+                    chunk_sink=sink,  # type: ignore[arg-type]
+                )
 
-            job = await _video_job_manager(request).submit(
-                source=source,
-                metadata={"model": model, "avatar_id": avatar_id, "title": title},
-                runner=run_async_job,
-                wait_for_start=wait_for_rtmps,
-            )
+            try:
+                job = await _video_job_manager(request).submit(
+                    source=source,
+                    metadata={"model": model, "avatar_id": avatar_id, "title": title},
+                    runner=run_async_job,
+                    wait_for_start=wait_for_rtmps,
+                    cleanup=cleanup_async_job,
+                )
+            except BaseException:
+                cleanup_async_job()
+                raise
             emotion_audio_path = None
             response.status_code = 202
             return job.public()

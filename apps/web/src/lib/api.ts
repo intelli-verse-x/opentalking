@@ -74,8 +74,8 @@ async function throwIfNotOk(r: Response): Promise<void> {
   throw new ApiError(r.status, detail, body);
 }
 
-export async function apiGet<T>(path: string): Promise<T> {
-  const r = await fetch(buildApiUrl(path));
+export async function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const r = await fetch(buildApiUrl(path), { signal });
   await throwIfNotOk(r);
   return r.json() as Promise<T>;
 }
@@ -86,8 +86,8 @@ export async function apiGet<T>(path: string): Promise<T> {
  * optionally attach a token without duplicating response/error handling in
  * the workspace component.
  */
-export async function apiGetWithHeaders<T>(path: string, headers: Record<string, string>): Promise<T> {
-  const r = await fetch(buildApiUrl(path), { headers });
+export async function apiGetWithHeaders<T>(path: string, headers: Record<string, string>, signal?: AbortSignal): Promise<T> {
+  const r = await fetch(buildApiUrl(path), { headers, signal });
   await throwIfNotOk(r);
   return r.json() as Promise<T>;
 }
@@ -106,11 +106,13 @@ export async function apiPostWithHeaders<T>(
   path: string,
   body: unknown,
   headers: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const r = await fetch(buildApiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json", ...headers },
     body: JSON.stringify(body),
+    signal,
   });
   await throwIfNotOk(r);
   return r.json() as Promise<T>;
@@ -538,36 +540,41 @@ export async function createVideoCreationRTMPSJob(
   );
 }
 
-export async function getVideoCreationJob(jobId: string): Promise<VideoCreationJobResponse> {
-  return apiGet<VideoCreationJobResponse>(`/video-creation/jobs/${encodeURIComponent(jobId)}`);
+export async function getVideoCreationJob(jobId: string, signal?: AbortSignal): Promise<VideoCreationJobResponse> {
+  return apiGet<VideoCreationJobResponse>(`/video-creation/jobs/${encodeURIComponent(jobId)}`, signal);
 }
 
 export async function getVideoCreationRTMPSJob(
   jobId: string,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
 ): Promise<VideoCreationRTMPSJob> {
   return apiGetWithHeaders<VideoCreationRTMPSJob>(
     `/streaming/rtmps-jobs/${encodeURIComponent(jobId)}`,
     headers,
+    signal,
   );
 }
 
-export async function stopVideoCreationJob(jobId: string): Promise<VideoCreationJobResponse> {
+export async function stopVideoCreationJob(jobId: string, signal?: AbortSignal): Promise<VideoCreationJobResponse> {
   return apiPostWithHeaders<VideoCreationJobResponse>(
     `/video-creation/jobs/${encodeURIComponent(jobId)}/stop`,
     {},
     {},
+    signal,
   );
 }
 
 export async function stopVideoCreationRTMPSJob(
   jobId: string,
   headers: Record<string, string> = {},
+  signal?: AbortSignal,
 ): Promise<VideoCreationRTMPSJob> {
   return apiPostWithHeaders<VideoCreationRTMPSJob>(
     `/streaming/rtmps-jobs/${encodeURIComponent(jobId)}/stop`,
     {},
     headers,
+    signal,
   );
 }
 

@@ -494,10 +494,14 @@ class _IncrementalVideoWriter:
         self._writer.write(np.ascontiguousarray(arr))
         self.frames_written += 1
 
+    def abort(self) -> None:
+        """Release an unfinished archive without claiming it contains frames."""
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.release()
+
     def close(self) -> None:
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
+        self.abort()
         if self.frames_written <= 0:
             raise RuntimeError("video creation produced zero frames")
 
@@ -1671,12 +1675,10 @@ class VideoCreationService:
                 await emitter.flush()
                 archive_writer.close()
             except Exception:
-                try:
-                    archive_writer.close()
-                except Exception:
-                    pass
                 await _fail_video_chunks(chunk_sink, "video_generation_failed")
                 raise
+            finally:
+                archive_writer.abort()
         try:
             output_mp4 = work_dir / "result.mp4"
             await _ffmpeg_mux(
@@ -1855,12 +1857,10 @@ class VideoCreationService:
                         await light2d_emitter.flush()
                         light2d_archive_writer.close()
                     except Exception:
-                        try:
-                            light2d_archive_writer.close()
-                        except Exception:
-                            pass
                         await _fail_video_chunks(chunk_sink, "video_generation_failed")
                         raise
+                    finally:
+                        light2d_archive_writer.abort()
                 try:
                     output_mp4 = work_dir / "result.mp4"
                     await _ffmpeg_mux(
@@ -1931,57 +1931,63 @@ class VideoCreationService:
         raw_frame_index = 0
         emitted_frame_count = 0
         try:
-            await client.init_session(
-                **_init_session_kwargs(
-                    model=model_value,
-                    avatar_path=avatar_path,
-                    settings=self.settings,
-                    backend=backend,
-                    fasterliveportrait_config=fasterliveportrait_config,
+            try:
+                await client.init_session(
+                    **_init_session_kwargs(
+                        model=model_value,
+                        avatar_path=avatar_path,
+                        settings=self.settings,
+                        backend=backend,
+                        fasterliveportrait_config=fasterliveportrait_config,
+                    )
                 )
-            )
-            await client.prewarm()
-            chunk_samples = max(1, int(client.audio_chunk_samples or round(sample_rate / max(1, client.fps))))
-            pad_len = (-len(render_source_pcm)) % chunk_samples
-            render_pcm = render_source_pcm if not pad_len else np.concatenate([
-                render_source_pcm,
-                np.zeros(pad_len, dtype=np.int16),
-            ])
-            fps = float(client.fps or 25)
-            preroll_frames = max(0, int(round(float(preroll_samples) * fps / float(sample_rate)))) if preroll_samples else 0
-            target_frames = max(1, int(round(float(pcm.size) * fps / float(sample_rate))))
-            if chunk_sink is not None:
-                video_only = work_dir / "video_only.mp4"
-                archive_writer = _IncrementalVideoWriter(video_only, fps=fps)
-                emitter = _VideoChunkEmitter(
-                    pcm=pcm,
-                    fps=fps,
-                    sink=chunk_sink,
-                    chunk_duration_ms=_settings_int(self.settings, "video_creation_chunk_duration_ms", 1000),
-                )
-            for start in range(0, len(render_pcm), chunk_samples):
-                chunk = render_pcm[start:start + chunk_samples]
-                for frame in await client.generate(chunk):
-                    arr = _frame_array(frame)
-                    if arr is None:
-                        continue
-                    if chunk_sink is None:
-                        frames.append(arr)
-                        continue
-                    if raw_frame_index < preroll_frames or emitted_frame_count >= target_frames:
+                await client.prewarm()
+                chunk_samples = max(1, int(client.audio_chunk_samples or round(sample_rate / max(1, client.fps))))
+                pad_len = (-len(render_source_pcm)) % chunk_samples
+                render_pcm = render_source_pcm if not pad_len else np.concatenate([
+                    render_source_pcm,
+                    np.zeros(pad_len, dtype=np.int16),
+                ])
+                fps = float(client.fps or 25)
+                preroll_frames = max(0, int(round(float(preroll_samples) * fps / float(sample_rate)))) if preroll_samples else 0
+                target_frames = max(1, int(round(float(pcm.size) * fps / float(sample_rate))))
+                if chunk_sink is not None:
+                    video_only = work_dir / "video_only.mp4"
+                    archive_writer = _IncrementalVideoWriter(video_only, fps=fps)
+                    emitter = _VideoChunkEmitter(
+                        pcm=pcm,
+                        fps=fps,
+                        sink=chunk_sink,
+                        chunk_duration_ms=_settings_int(self.settings, "video_creation_chunk_duration_ms", 1000),
+                    )
+                for start in range(0, len(render_pcm), chunk_samples):
+                    chunk = render_pcm[start:start + chunk_samples]
+                    for frame in await client.generate(chunk):
+                        arr = _frame_array(frame)
+                        if arr is None:
+                            continue
+                        if chunk_sink is None:
+                            frames.append(arr)
+                            continue
+                        if raw_frame_index < preroll_frames or emitted_frame_count >= target_frames:
+                            raw_frame_index += 1
+                            continue
+                        if composer is None:
+                            composer = _VideoFrameComposer(arr, normalized_composition_config)
+                        composed = composer.apply(arr)
+                        assert archive_writer is not None and emitter is not None
+                        archive_writer.write(composed)
+                        await emitter.add_frame(composed)
+                        await asyncio.sleep(0)
                         raw_frame_index += 1
-                        continue
-                    if composer is None:
-                        composer = _VideoFrameComposer(arr, normalized_composition_config)
-                    composed = composer.apply(arr)
-                    assert archive_writer is not None and emitter is not None
-                    archive_writer.write(composed)
-                    await emitter.add_frame(composed)
-                    await asyncio.sleep(0)
-                    raw_frame_index += 1
-                    emitted_frame_count += 1
-        finally:
-            await client.close()
+                        emitted_frame_count += 1
+            finally:
+                await client.close()
+
+        except BaseException:
+            if archive_writer is not None:
+                archive_writer.abort()
+            raise
 
         video_only = work_dir / "video_only.mp4"
         if chunk_sink is None:
@@ -2000,12 +2006,10 @@ class VideoCreationService:
                 await emitter.flush()
                 archive_writer.close()
             except Exception:
-                try:
-                    archive_writer.close()
-                except Exception:
-                    pass
                 await _fail_video_chunks(chunk_sink, "video_generation_failed")
                 raise
+            finally:
+                archive_writer.abort()
         try:
             output_mp4 = work_dir / "result.mp4"
             await _ffmpeg_mux(

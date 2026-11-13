@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +32,7 @@ class VideoCreationJob:
     # Publish-mode jobs use this gate so the RTMPS subscriber can be installed
     # before the renderer emits its first MediaChunk.
     start_event: asyncio.Event | None = field(default=None, repr=False)
+    cleanup: Callable[[], None] | None = field(default=None, repr=False)
     first_sequence: int | None = None
     first_pts_ms: float | None = None
 
@@ -106,6 +108,13 @@ class VideoCreationJobManager:
         except (TypeError, ValueError):
             return 5.0
 
+    def _publish_gate_timeout_sec(self) -> float:
+        try:
+            raw = float(getattr(self.settings, "video_creation_publish_gate_timeout_sec", 120.0))
+            return min(3600.0, max(0.01, raw)) if math.isfinite(raw) else 120.0
+        except (TypeError, ValueError):
+            return 120.0
+
     async def submit(
         self,
         *,
@@ -113,6 +122,7 @@ class VideoCreationJobManager:
         metadata: Mapping[str, Any] | None,
         runner: VideoJobRunner,
         wait_for_start: bool = False,
+        cleanup: Callable[[], None] | None = None,
     ) -> VideoCreationJob:
         job_id = f"job_{uuid.uuid4().hex[:16]}"
         job = VideoCreationJob(
@@ -125,21 +135,40 @@ class VideoCreationJobManager:
                 subscriber_put_timeout_sec=self._subscriber_put_timeout_sec(),
             ),
             start_event=asyncio.Event() if wait_for_start else None,
+            cleanup=cleanup,
         )
         async with self._lock:
             self.jobs[job_id] = job
         job.task = asyncio.create_task(self._run(job, runner), name=f"video-creation-{job_id}")
         return job
 
+    @staticmethod
+    def _cleanup_job(job: VideoCreationJob) -> None:
+        # Claim before invoking: stop() also handles cancellation before _run
+        # begins, and repeated stop/delete must not repeat ownership cleanup.
+        cleanup, job.cleanup = job.cleanup, None
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:  # noqa: BLE001
+                job.error_code = job.error_code or "cleanup_failed"
+                job.error_detail = "video job resource cleanup failed"
+
     async def _run(self, job: VideoCreationJob, runner: VideoJobRunner) -> None:
-        if job.start_event is not None:
-            job.status = "waiting_publisher"
-            job.updated_at = time.time()
-            await job.start_event.wait()
-        job.status = "generating"
-        job.updated_at = time.time()
         sink = VideoJobChunkSink(job)
         try:
+            if job.start_event is not None:
+                job.status = "waiting_publisher"
+                job.updated_at = time.time()
+                try:
+                    await asyncio.wait_for(
+                        job.start_event.wait(), timeout=self._publish_gate_timeout_sec()
+                    )
+                except asyncio.TimeoutError:
+                    job.error_code = "publisher_start_timeout"
+                    raise
+            job.status = "generating"
+            job.updated_at = time.time()
             result = await runner(sink)
             job.result = result
             job.finalized_at = time.time()
@@ -165,6 +194,8 @@ class VideoCreationJobManager:
             job.updated_at = time.time()
             if not job.hub.closed:
                 await job.hub.fail(job.error_code, job.error_detail)
+        finally:
+            self._cleanup_job(job)
 
     async def start(self, job_id: str) -> VideoCreationJob:
         """Release a publish-gated job after its subscriber is ready."""
@@ -189,8 +220,15 @@ class VideoCreationJobManager:
                 await job.task
             except asyncio.CancelledError:
                 pass
-        elif job.status not in {"completed", "failed", "stopped"}:
+        # Cancellation can precede the coroutine's first instruction, so its
+        # own cleanup may never run. Stop still owes a terminal source/hub.
+        if job.status not in {"completed", "failed", "stopped"}:
             job.status = "stopped"
+            job.error_code = "stopped"
+            job.updated_at = time.time()
+        self._cleanup_job(job)
+        if job.status == "stopped" and not job.hub.closed:
+            await job.hub.fail("stopped")
         return job
 
     async def delete(self, job_id: str) -> None:

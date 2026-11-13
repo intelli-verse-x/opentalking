@@ -434,6 +434,10 @@ class Settings(BaseSettings):
     # Maximum time an RTMPS subscriber may block a source chunk publish. Once
     # exceeded, that subscriber fails closed and MP4 generation continues.
     video_creation_chunk_publish_timeout_sec: float = 5.0
+    # Bound jobs whose browser response was lost before a publisher attached.
+    video_creation_publish_gate_timeout_sec: float = Field(
+        default=120.0, gt=0.0, le=3600.0, allow_inf_nan=False
+    )
     avatar_matting_provider: str = "rembg"
     avatar_matting_device: str = "cpu"
     avatar_matting_model_path: str = ""

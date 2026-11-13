@@ -1791,7 +1791,7 @@ class KnowledgeStore:
             if result.rowcount == 0:
                 raise KeyError("knowledge document not found")
             conn.execute(
-                "DELETE FROM knowledge_chunks WHERE kb_id = ? AND id = ?",
+                "DELETE FROM knowledge_chunks WHERE kb_id = ? AND doc_id = ?",
                 (kb_id, doc_id),
             )
         return self._get_document_sync(kb_id, doc_id)

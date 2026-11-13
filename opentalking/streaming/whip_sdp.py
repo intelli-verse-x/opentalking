@@ -85,7 +85,13 @@ def validate_offer_sdp(
                 raise WhipSdpError("WHIP offer contains a private host candidate; configure approved relay/egress")
 
 
-def validate_answer_sdp(offer_sdp: str, answer_sdp: str) -> None:
+def validate_answer_sdp(
+    offer_sdp: str,
+    answer_sdp: str,
+    *,
+    allow_private_candidates: bool = False,
+    allowed_cidrs: tuple[str, ...] | list[str] = (),
+) -> None:
     offer = _require_common(offer_sdp, role="offer")
     answer = _require_common(answer_sdp, role="answer")
     if len(offer) != len(answer):  # defensive; _require_common currently fixes both at two
@@ -99,3 +105,27 @@ def validate_answer_sdp(offer_sdp: str, answer_sdp: str) -> None:
         raise WhipSdpError("WHIP answer did not negotiate H264")
     if not any("opus/48000" in line.lower() for line in answer[1]):
         raise WhipSdpError("WHIP answer did not negotiate Opus")
+
+    # HTTP target pinning does not constrain the peer addresses carried in SDP.
+    # Validate them before aiortc can initiate ICE checks. Hostname candidates
+    # cannot be pinned by this validator and must fail closed.
+    networks = [ipaddress.ip_network(item, strict=False) for item in allowed_cidrs]
+    for raw in answer_sdp.splitlines():
+        line = raw.strip()
+        if not line.startswith("a=candidate:"):
+            continue
+        match = _CANDIDATE_ADDRESS.match(line)
+        if not match:
+            raise WhipSdpError("WHIP answer contains an invalid ICE candidate")
+        host = match.group(1)
+        try:
+            if "%" in host:
+                raise ValueError("scoped address")
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise WhipSdpError("WHIP answer candidate must use an IP literal") from exc
+        if address.is_multicast or address.is_unspecified:
+            raise WhipSdpError("WHIP answer contains an invalid ICE target")
+        private = address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
+        if private and not allow_private_candidates and not any(address in network for network in networks):
+            raise WhipSdpError("WHIP answer contains an unapproved private ICE target")

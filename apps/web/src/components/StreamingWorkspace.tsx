@@ -5,6 +5,7 @@ import {
   apiGetWithHeaders,
   apiPostWithHeaders,
 } from "../lib/api";
+import { deleteWhepResource, receiverCanStop, whepResource, type WhepResource } from "../lib/streamingSecurity";
 import type { ToastTone } from "./ToastStack";
 import { HlsVideoPlayer, type HlsPlayerState } from "./HlsVideoPlayer";
 
@@ -227,7 +228,8 @@ export function StreamingWorkspace({
   const [receiverError, setReceiverError] = useState<string | null>(null);
   const [receiverStream, setReceiverStream] = useState<MediaStream | null>(null);
   const receiverPcRef = useRef<RTCPeerConnection | null>(null);
-  const receiverResourceRef = useRef<string | null>(null);
+  const receiverResourceRef = useRef<WhepResource | null>(null);
+  const receiverAbortRef = useRef<AbortController | null>(null);
   const receiverVideoRef = useRef<HTMLVideoElement>(null);
   const receiverStreamRef = useRef<MediaStream | null>(null);
 
@@ -283,30 +285,32 @@ export function StreamingWorkspace({
     }
   }, [receiverStream]);
 
-  const stopReceiver = useCallback(async () => {
+  const stopReceiver = useCallback(() => {
     const resource = receiverResourceRef.current;
     receiverResourceRef.current = null;
-    if (resource && whepToken.trim()) {
-      try {
-        await fetch(resource, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${whepToken.trim()}` },
-        });
-      } catch {
-        /* Closing the peer connection is sufficient for local playback. */
-      }
-    }
-    receiverPcRef.current?.close();
+    receiverAbortRef.current?.abort();
+    receiverAbortRef.current = null;
+    const pc = receiverPcRef.current;
     receiverPcRef.current = null;
+    pc?.close();
     receiverStreamRef.current?.getTracks().forEach((track) => track.stop());
     receiverStreamRef.current = null;
     setReceiverStream(null);
     setReceiverState("idle");
-  }, [whepToken]);
+    if (resource) void deleteWhepResource(resource);
+  }, []);
 
   useEffect(() => () => {
-    receiverPcRef.current?.close();
+    const resource = receiverResourceRef.current;
+    receiverResourceRef.current = null;
+    receiverAbortRef.current?.abort();
+    receiverAbortRef.current = null;
+    const pc = receiverPcRef.current;
+    receiverPcRef.current = null;
+    pc?.close();
     receiverStreamRef.current?.getTracks().forEach((track) => track.stop());
+    receiverStreamRef.current = null;
+    if (resource) void deleteWhepResource(resource);
   }, []);
 
   const waitForIceGathering = useCallback(async (pc: RTCPeerConnection) => {
@@ -330,19 +334,28 @@ export function StreamingWorkspace({
   const startReceiver = useCallback(async () => {
     const endpoint = whepEndpoint.trim();
     const token = whepToken.trim();
-    if (!endpoint || !endpoint.startsWith("https://")) {
+    let endpointValid = false;
+    try {
+      const parsed = new URL(endpoint);
+      endpointValid = parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.hash;
+    } catch { /* Invalid endpoint stays an actionable input error. */ }
+    if (!endpointValid) {
       setReceiverError("WHEP endpoint 必须使用 https://");
       setReceiverState("error");
       return;
     }
-    await stopReceiver();
+    stopReceiver();
     setReceiverState("connecting");
     setReceiverError(null);
     const pc = new RTCPeerConnection();
     receiverPcRef.current = pc;
+    const controller = new AbortController();
+    receiverAbortRef.current = controller;
+    const current = () => receiverPcRef.current === pc && !controller.signal.aborted;
     pc.addTransceiver("video", { direction: "recvonly" });
     pc.addTransceiver("audio", { direction: "recvonly" });
     pc.ontrack = (event) => {
+      if (!current()) return;
       const stream = event.streams[0] ?? receiverStreamRef.current ?? new MediaStream();
       if (!event.streams[0] && !stream.getTracks().some((track) => track.id === event.track.id)) {
         stream.addTrack(event.track);
@@ -351,6 +364,7 @@ export function StreamingWorkspace({
       setReceiverStream(stream);
     };
     pc.onconnectionstatechange = () => {
+      if (!current()) return;
       if (pc.connectionState === "connected") setReceiverState("live");
       if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
         setReceiverState("error");
@@ -358,6 +372,7 @@ export function StreamingWorkspace({
       }
     };
     pc.oniceconnectionstatechange = () => {
+      if (!current()) return;
       if (["failed", "disconnected"].includes(pc.iceConnectionState)) {
         setReceiverState("error");
         setReceiverError(`WHEP ICE 连接失败：${pc.iceConnectionState}。请确认本地 harness 已映射 8189/udp 和 8190/tcp。`);
@@ -365,8 +380,11 @@ export function StreamingWorkspace({
     };
     try {
       const offer = await pc.createOffer();
+      if (!current()) return;
       await pc.setLocalDescription(offer);
+      if (!current()) return;
       await waitForIceGathering(pc);
+      if (!current()) return;
       const local = pc.localDescription;
       if (!local?.sdp) throw new Error("浏览器没有生成有效的 WebRTC offer");
       const headers: Record<string, string> = {
@@ -378,20 +396,32 @@ export function StreamingWorkspace({
         method: "POST",
         headers,
         body: local.sdp,
+        redirect: "error",
+        signal: controller.signal,
       });
+      const location = response.headers.get("Location");
+      const resource = location ? whepResource(endpoint, location, token) : null;
+      if (!current()) {
+        if (resource) void deleteWhepResource(resource);
+        return;
+      }
+      if (resource) receiverResourceRef.current = resource;
       if (!response.ok) {
         const detail = await response.text();
         throw new Error(`WHEP ${response.status}${detail ? `：${detail}` : ""}`);
       }
       const answer = await response.text();
+      if (!current()) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
-      const location = response.headers.get("Location");
-      if (location) receiverResourceRef.current = new URL(location, endpoint).toString();
+      if (!current()) return;
       setReceiverState("live");
       notify("WHEP 接收已连接，下面的视频区域正在播放。", "success");
     } catch (err) {
-      pc.close();
-      receiverPcRef.current = null;
+      if (!current()) {
+        pc.close();
+        return;
+      }
+      stopReceiver();
       setReceiverState("error");
       const message = errorMessage(err, "WHEP 接收失败");
       setReceiverError(message.includes("CERTIFICATE") ? "浏览器不信任本地证书，请先打开 WHEP 地址并接受证书。" : message);
@@ -690,7 +720,7 @@ export function StreamingWorkspace({
               </div>
               <Field label="接收 Bearer Token（格式：reader:读取密码）" value={whepToken} onChange={setWhepToken} type="password" autoComplete="off" />
               <div className="flex flex-wrap gap-2">
-                {receiverState === "live" || receiverState === "connecting" ? (
+                {receiverCanStop(receiverState, Boolean(receiverPcRef.current), Boolean(receiverResourceRef.current)) ? (
                   <button type="button" onClick={() => void stopReceiver()} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:border-red-200 hover:text-red-700">停止接收</button>
                 ) : (
                   <button type="button" onClick={() => void startReceiver()} className="rounded-lg bg-slate-950 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800">开始 WHEP 接收</button>

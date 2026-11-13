@@ -11,17 +11,27 @@ import argparse
 import ipaddress
 import os
 import secrets
+import tempfile
 from pathlib import Path
 
 
 def _write_private(path: Path, data: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(path, flags, 0o600)
+    # The harness is POSIX-only. Do not imply chmod bits provide a Windows ACL.
+    if os.name != "posix":
+        raise RuntimeError("private harness credential files require a POSIX host")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
-        os.write(fd, data.encode("utf-8"))
+        # mkstemp creates a private 0600 file before any credential bytes are
+        # written. Replacing the path also avoids following an existing symlink.
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
     finally:
-        os.close(fd)
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:

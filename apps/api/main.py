@@ -34,10 +34,18 @@ async def lifespan(app: FastAPI):
     app.state.worker_boot_id = uuid.uuid4().hex
     r = redis.from_url(settings.redis_url, decode_responses=True)
     app.state.redis = r
-    yield
-    await app.state.rtmps_video_jobs.close()
-    await app.state.video_creation_jobs.close()
-    await r.aclose()
+    try:
+        yield
+    finally:
+        # Preserve shutdown order while attempting every owned resource even
+        # if the application body or an earlier close operation raises.
+        try:
+            await app.state.rtmps_video_jobs.close()
+        finally:
+            try:
+                await app.state.video_creation_jobs.close()
+            finally:
+                await r.aclose()
 
 
 def create_app() -> FastAPI:

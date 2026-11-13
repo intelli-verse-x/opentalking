@@ -356,7 +356,12 @@ class WHIPPublisher:
         )
         self.resource_url = resource
         try:
-            validate_answer_sdp(local.sdp, answer_sdp)
+            validate_answer_sdp(
+                local.sdp,
+                answer_sdp,
+                allow_private_candidates=self.settings.allow_local,
+                allowed_cidrs=self.settings.allowed_cidrs,
+            )
             await self.pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
         except Exception as exc:
             # A 201 may have created a server-side resource already. Delete

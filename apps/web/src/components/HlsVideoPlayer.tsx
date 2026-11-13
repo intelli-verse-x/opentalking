@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
+import { mediaRequestCredentials } from "../lib/streamingSecurity";
 
 export type HlsPlayerState = "idle" | "loading" | "ready" | "playing" | "ended" | "error";
 
@@ -174,13 +175,13 @@ export function HlsVideoPlayer({
         ...(oncePlayback
           ? { liveSyncDuration: 60, liveMaxLatencyDuration: 90, liveSyncMode: "buffered" as const, initialLiveManifestSize: 1 }
           : { liveSyncDurationCount: 1, liveMaxLatencyDurationCount: 3 }),
-        xhrSetup: (xhr: XMLHttpRequest) => {
-          // MediaMTX performs a cookie-check redirect before serving the
-          // playlist and child playlists. The player is cross-origin from
-          // the Studio page, so explicitly keep that cookie on every HLS
-          // request in addition to the Basic Authorization header.
-          xhr.withCredentials = true;
-          if (authorization) xhr.setRequestHeader("Authorization", authorization);
+        xhrSetup: (xhr: XMLHttpRequest, url: string) => {
+          // MediaMTX needs cookies and Basic auth on its selected origin.
+          // Playlists can reference foreign segments/keys: never attach the
+          // selected origin's credentials to those requests.
+          const credentials = mediaRequestCredentials(src, url, window.location.href, authorization);
+          xhr.withCredentials = credentials.withCredentials;
+          if (credentials.authorization) xhr.setRequestHeader("Authorization", credentials.authorization);
         },
       };
       hls = new Hls(hlsConfig);

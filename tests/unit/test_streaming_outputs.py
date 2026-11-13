@@ -7,7 +7,11 @@ import pytest
 
 from opentalking.core.in_memory_redis import InMemoryRedis
 from opentalking.streaming.outputs import SessionOutputController
-from opentalking.streaming.destinations.rtmps import RTMPSSettings, build_rtmps_url, validate_stream_key
+from opentalking.streaming.destinations.rtmps import (
+    RTMPSSettings,
+    build_rtmps_url,
+    validate_stream_key,
+)
 from opentalking.streaming.security import validate_target_url
 
 
@@ -25,7 +29,9 @@ class _FakeProgram:
 
 
 @pytest.mark.asyncio
-async def test_output_controller_does_not_expose_secrets_and_enforces_idempotency(monkeypatch) -> None:
+async def test_output_controller_does_not_expose_secrets_and_enforces_idempotency(
+    monkeypatch,
+) -> None:
     class Publisher:
         def __init__(self, settings) -> None:
             self.settings = settings
@@ -55,7 +61,9 @@ async def test_output_controller_does_not_expose_secrets_and_enforces_idempotenc
         streaming_audio_sample_rate=48000,
         streaming_audio_tick_ms=20,
     )
-    controller = SessionOutputController(session_id="sess", program=_FakeProgram(), settings=settings)
+    controller = SessionOutputController(
+        session_id="sess", program=_FakeProgram(), settings=settings
+    )
     body = {
         "type": "rtmps",
         "name": "local",
@@ -130,7 +138,10 @@ def test_rtmps_structured_url_and_target_validation() -> None:
         password="secret",
         allow_local=True,
     )
-    assert build_rtmps_url(settings) == "rtmps://localhost:1936/live/demo-key?user=publisher&pass=secret"
+    assert (
+        build_rtmps_url(settings)
+        == "rtmps://localhost:1936/live/demo-key?user=publisher&pass=secret"
+    )
     with pytest.raises(ValueError):
         validate_stream_key("bad/key")
     with pytest.raises(ValueError):
@@ -302,9 +313,69 @@ async def test_lifecycle_action_receipt_deduplicates_connect(monkeypatch) -> Non
             "transport": {"endpoint": "rtmps://localhost:1936/live", "stream_key": "key"},
         }
     )
-    assert await controller.reserve_action_idempotency(record.output_id, "connect", "connect-1") is False
+    assert (
+        await controller.reserve_action_idempotency(record.output_id, "connect", "connect-1")
+        is False
+    )
     controller.request_connect(record.output_id)
     await asyncio.sleep(0.02)
-    assert await controller.reserve_action_idempotency(record.output_id, "connect", "connect-1") is True
+    assert (
+        await controller.reserve_action_idempotency(record.output_id, "connect", "connect-1")
+        is True
+    )
     assert record.publisher.starts == 1
     await controller.delete(record.output_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handshake_started", [False, True])
+async def test_disconnect_preempts_pending_handshake(monkeypatch, handshake_started) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    stopped = []
+
+    class Publisher:
+        def __init__(self, settings):
+            self.state, self.health, self.last_error = "created", "unknown", None
+
+        async def start(self):
+            self.state = "connecting"
+            started.set()
+            await release.wait()
+            self.state = "connected"
+
+        async def stop(self):
+            stopped.append(True)
+            self.state = "disconnected"
+
+        async def video(self, item):
+            pass
+
+        async def audio(self, item):
+            pass
+
+    monkeypatch.setattr("opentalking.streaming.outputs.RTMPSPublisher", Publisher)
+    program = _FakeProgram()
+    controller = SessionOutputController(
+        session_id="sess",
+        program=program,
+        settings=SimpleNamespace(streaming_allow_local_targets=True, streaming_video_fps=25),
+    )
+    record = await controller.create(
+        {
+            "type": "rtmps",
+            "transport": {"endpoint": "rtmps://localhost:1936/live", "stream_key": "fixture-only"},
+        }
+    )
+    controller.request_connect(record.output_id)
+    connect = controller._connect_tasks[record.output_id]
+    if handshake_started:
+        await asyncio.wait_for(started.wait(), timeout=1)
+    controller.request_disconnect(record.output_id)
+    disconnect = controller._connect_tasks[record.output_id]
+    await asyncio.wait_for(disconnect, timeout=1)
+    release.set()
+    await asyncio.sleep(0)
+    assert connect.cancelled()
+    assert stopped and record.connection_state.value == "disconnected"
+    assert record.publisher.state == "disconnected" and program.added == {}
+    await controller.close()

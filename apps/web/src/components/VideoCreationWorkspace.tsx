@@ -51,6 +51,7 @@ import {
   QWEN_VOICE_CLONE_TARGET_OPTIONS,
 } from "../constants/ttsQwen";
 import { buildTTSPreviewPayload, requestDuoDialogPreview, requestTTSPreview } from "../lib/ttsPreview";
+import { PublicationOwnership, knownPublicationStatus, canStartVideoPublication, publicationControlsVisible, publicationTerminal, stopPublicationJobs, waitForVideoPublication } from "../lib/videoPublication";
 import { HlsVideoPlayer, type HlsPlayerState } from "./HlsVideoPlayer";
 
 export type VideoCreationAudioSource = "upload" | "tts_text" | "duo_dialog";
@@ -493,6 +494,19 @@ export function VideoCreationWorkspace({
   const [draggingDuoLineId, setDraggingDuoLineId] = useState<string | null>(null);
   const [title, setTitle] = useState("数字人口播视频");
   const [generating, setGenerating] = useState(false);
+  const publicationRunRef = useRef<AbortController | null>(null);
+  const publicationModeRef = useRef(false);
+  const publicationOwnerRef = useRef(new PublicationOwnership());
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      publicationOwnerRef.current.beginRun();
+      publicationRunRef.current?.abort();
+      publicationRunRef.current = null;
+    };
+  }, []);
   const [result, setResult] = useState<ExportVideoItem | null>(null);
   const [publishRtmps, setPublishRtmps] = useState(false);
   const [rtmpsEndpoint, setRtmpsEndpoint] = useState("rtmps://127.0.0.1:1936/live");
@@ -506,6 +520,8 @@ export function VideoCreationWorkspace({
   const [hlsPlayerState, setHlsPlayerState] = useState<HlsPlayerState>("idle");
   const [videoJobStatus, setVideoJobStatus] = useState<VideoCreationJobResponse | null>(null);
   const [rtmpsJobStatus, setRtmpsJobStatus] = useState<VideoCreationRTMPSJob | null>(null);
+  const knownSourceStatus = knownPublicationStatus(videoJobStatus);
+  const knownOutputStatus = knownPublicationStatus(rtmpsJobStatus);
   const [cloneOpen, setCloneOpen] = useState(false);
   const [duoCloneTargetRole, setDuoCloneTargetRole] = useState<DuoDialogRole | null>(null);
   const [ttsPreviewing, setTtsPreviewing] = useState(false);
@@ -895,24 +911,27 @@ export function VideoCreationWorkspace({
   }, [duoDialogGapMs, duoDialogLines, duoDialogSelected, duoDialogSpeakers, edgeVoice, effectiveIndexTTSConfig, indexttsConfig.emotion_mode, indexttsEmotionAudioFile, onNotify, qwenModel, qwenVoice, showIndexTTSControls, text, ttsProvider]);
 
   const stopActiveVideoJobs = useCallback(async () => {
+    const run = publicationRunRef.current;
+    const ticket = publicationOwnerRef.current.beginStop();
+    run?.abort();
+    const controlHeaders: Record<string, string> = {};
+    if (streamingControlToken.trim()) controlHeaders.Authorization = `Bearer ${streamingControlToken.trim()}`;
+    const cleanup = new AbortController();
+    const timer = window.setTimeout(() => cleanup.abort(), 15000);
     try {
-      const controlHeaders: Record<string, string> = {};
-      if (streamingControlToken.trim()) {
-        controlHeaders.Authorization = `Bearer ${streamingControlToken.trim()}`;
-      }
-      if (rtmpsJobStatus?.rtmps_job_id) {
-        await stopVideoCreationRTMPSJob(rtmpsJobStatus.rtmps_job_id, controlHeaders);
-      }
-      if (videoJobStatus?.job_id) {
-        await stopVideoCreationJob(videoJobStatus.job_id);
-      }
+      const [output, source] = await Promise.allSettled([
+        rtmpsJobStatus?.rtmps_job_id ? stopVideoCreationRTMPSJob(rtmpsJobStatus.rtmps_job_id, controlHeaders, cleanup.signal) : Promise.resolve(null),
+        videoJobStatus?.job_id ? stopVideoCreationJob(videoJobStatus.job_id, cleanup.signal) : Promise.resolve(null),
+      ]);
+      if (!mountedRef.current || !publicationOwnerRef.current.ownsStop(ticket)) return;
+      if (output.status === "fulfilled" && output.value) setRtmpsJobStatus(output.value);
+      if (source.status === "fulfilled" && source.value) setVideoJobStatus(source.value);
       setHlsPreviewActive(false);
       setHlsPlayerState("idle");
-      setGenerating(false);
-      onNotify?.("已停止视频生成和 RTMPS 发布。", "info");
-    } catch (error) {
-      const detail = error instanceof ApiError ? error.detail : error instanceof Error ? error.message : null;
-      onNotify?.(detail ? `停止失败：${detail}` : "停止视频任务失败。", "error");
+      const failed = output.status === "rejected" || source.status === "rejected";
+      onNotify?.(failed ? "停止未全部确认，请重试停止任务。" : "已请求停止生成和发布；状态仍需确认。", failed ? "error" : "info");
+    } finally {
+      window.clearTimeout(timer);
     }
   }, [onNotify, rtmpsJobStatus?.rtmps_job_id, streamingControlToken, videoJobStatus?.job_id]);
 
@@ -937,7 +956,7 @@ export function VideoCreationWorkspace({
     setHlsPreviewActive(true);
   }, [hlsEndpoint, hlsPreviewActive, hlsToken, onNotify]);
 
-  const createAndMaybePublish = useCallback(async (input: Parameters<typeof createVideoCreationJob>[0]): Promise<VideoCreationJobResponse> => {
+  const createAndMaybePublish = useCallback(async (input: Parameters<typeof createVideoCreationJob>[0], signal: AbortSignal): Promise<VideoCreationJobResponse> => {
     if (!publishRtmps) {
       return createVideoCreationJob(input);
     }
@@ -945,6 +964,11 @@ export function VideoCreationWorkspace({
       throw new Error("请填写 RTMPS endpoint、stream key 和发布密码。\n");
     }
     const source = await createVideoCreationJob({ ...input, executionMode: "async", waitForRTMPS: true });
+    if (signal.aborted) {
+      if (publicationRunRef.current?.signal === signal) setVideoJobStatus(source);
+      await stopPublicationJobs([(stopSignal) => stopVideoCreationJob(source.job_id, stopSignal)]);
+      throw new DOMException("Publication cancelled", "AbortError");
+    }
     setVideoJobStatus(source);
     const authHeaders: Record<string, string> = {};
     if (streamingControlToken.trim()) {
@@ -970,37 +994,24 @@ export function VideoCreationWorkspace({
       // The source is intentionally gated in publish mode. If RTMPS auth or
       // endpoint validation fails, release that gate by stopping the source
       // instead of leaving an in-memory job waiting forever.
-      await stopVideoCreationJob(source.job_id).catch(() => undefined);
+      await stopPublicationJobs([(stopSignal) => stopVideoCreationJob(source.job_id, stopSignal)]);
       throw error;
     }
-    setRtmpsJobStatus(output);
-    // Start HLS as soon as the RTMPS job exists. The player waits for the
-    // MediaMTX path to become online, so the user does not need to guess when
-    // the first playable segment is ready.
-    if (hlsEndpoint.trim() && hlsToken.trim()) {
-      setHlsPreviewActive(true);
+    if (publicationRunRef.current?.signal === signal) {
+      setRtmpsJobStatus(output);
+      if (!signal.aborted && hlsEndpoint.trim() && hlsToken.trim()) setHlsPreviewActive(true);
     }
-    let latestSource = source;
-    let latestOutput = output;
-    for (let attempt = 0; attempt < 7200; attempt += 1) {
-      if (latestSource.status === "completed" || latestSource.status === "failed" || latestSource.status === "stopped") {
-        if (["completed", "failed", "stopped"].includes(latestOutput.status)) break;
-      }
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 500));
-      latestSource = await getVideoCreationJob(source.job_id);
-      setVideoJobStatus(latestSource);
-      latestOutput = await getVideoCreationRTMPSJob(output.rtmps_job_id, authHeaders);
-      setRtmpsJobStatus(latestOutput);
-      if (["failed", "stopped"].includes(latestSource.status)) break;
-      if (["failed", "stopped"].includes(latestOutput.status) && latestSource.status === "completed") break;
-    }
-    if (latestSource.status !== "completed" || !latestSource.export_video) {
-      throw new Error(`视频任务未完成：${latestSource.error_code ?? latestSource.status}`);
-    }
-    if (["failed", "stopped"].includes(latestOutput.status)) {
-      throw new Error(`RTMPS 发布未完成：${latestOutput.error_code ?? latestOutput.status}`);
-    }
-    return latestSource;
+    return waitForVideoPublication({
+      source, output, signal,
+      readSource: (pollSignal) => getVideoCreationJob(source.job_id, pollSignal),
+      readOutput: (pollSignal) => getVideoCreationRTMPSJob(output.rtmps_job_id, authHeaders, pollSignal),
+      update: (latestSource, latestOutput) => {
+        setVideoJobStatus(latestSource);
+        setRtmpsJobStatus(latestOutput);
+      },
+      stopSource: (stopSignal) => stopVideoCreationJob(source.job_id, stopSignal),
+      stopOutput: (stopSignal) => stopVideoCreationRTMPSJob(output.rtmps_job_id, authHeaders, stopSignal),
+    });
   }, [hlsEndpoint, hlsToken, publishRtmps, rtmpsEndpoint, rtmpsPassword, rtmpsStreamKey, rtmpsUsername, selectedVideoOutputSize.height, selectedVideoOutputSize.width, streamingControlToken]);
 
   const handleGenerate = useCallback(async () => {
@@ -1034,6 +1045,14 @@ export function VideoCreationWorkspace({
       onNotify?.("请先上传 IndexTTS 情绪音频。", "info");
       return;
     }
+    if (!canStartVideoPublication(Boolean(publicationRunRef.current), knownSourceStatus, knownOutputStatus)) {
+      onNotify?.("上一个任务仍未确认结束，请等待或重试停止；不会覆盖现有任务 ID。", "info");
+      return;
+    }
+    const run = new AbortController();
+    publicationOwnerRef.current.beginRun();
+    publicationRunRef.current = run;
+    publicationModeRef.current = publishRtmps;
     setGenerating(true);
     setResult(null);
     setVideoJobStatus(null);
@@ -1052,7 +1071,8 @@ export function VideoCreationWorkspace({
           audioSource: "reference_video",
           durationSec: referenceDurationSec,
           compositionConfig,
-        });
+        }, run.signal);
+        if (run.signal.aborted || publicationRunRef.current !== run) return;
         if (!response.export_video) throw new Error("视频任务完成但没有返回 MP4 export");
         setResult(response.export_video);
         onExportCreated?.(response.export_video);
@@ -1071,7 +1091,8 @@ export function VideoCreationWorkspace({
           indexttsEmotionAudioFile,
           duoDialog: duoDialogRequest(duoDialogLines, duoDialogSpeakers, duoDialogGapMs),
           compositionConfig,
-        });
+        }, run.signal);
+        if (run.signal.aborted || publicationRunRef.current !== run) return;
         if (!response.export_video) throw new Error("视频任务完成但没有返回 MP4 export");
         setResult(response.export_video);
         onExportCreated?.(response.export_video);
@@ -1092,19 +1113,28 @@ export function VideoCreationWorkspace({
         indexttsConfig: effectiveIndexTTSConfig,
         indexttsEmotionAudioFile,
         compositionConfig,
-      });
+      }, run.signal);
+      if (run.signal.aborted || publicationRunRef.current !== run) return;
       if (!response.export_video) throw new Error("视频任务完成但没有返回 MP4 export");
       setResult(response.export_video);
       onExportCreated?.(response.export_video);
       onNotify?.(`视频创作已保存到资产库：${response.export_video.title}`, "success");
     } catch (error) {
-      console.warn("video creation job failed", error);
+      if (publicationRunRef.current !== run) return;
+      if (run.signal.aborted && error instanceof DOMException && error.name === "AbortError") {
+        onNotify?.("任务停止或清理结果请检查当前状态；未确认的任务可重试停止。", "info");
+        return;
+      }
+      console.warn("video creation job failed");
       const detail = error instanceof ApiError ? error.detail : error instanceof Error ? error.message : null;
       onNotify?.(detail ? `视频创作失败：${detail}` : "视频创作失败，请查看后端日志。", "error");
     } finally {
-      setGenerating(false);
+      if (publicationRunRef.current === run) {
+        publicationRunRef.current = null;
+        setGenerating(false);
+      }
     }
-  }, [audioFile, audioSource, compositionConfig, createAndMaybePublish, duoDialogAvailable, duoDialogGapMs, duoDialogLines, duoDialogSpeakers, edgeVoice, effectiveIndexTTSConfig, effectiveModel, fasterliveportraitConfig, hlsEndpoint, hlsToken, indexttsConfig.emotion_mode, indexttsEmotionAudioFile, isReferenceVideoMode, models, onExportCreated, onNotify, publishRtmps, qwenModel, qwenVoice, referenceDurationSec, selectedAvatar, showIndexTTSEmotionStrength, showIndexTTSControls, text, title, ttsProvider]);
+  }, [audioFile, audioSource, compositionConfig, createAndMaybePublish, duoDialogAvailable, duoDialogGapMs, duoDialogLines, duoDialogSpeakers, edgeVoice, effectiveIndexTTSConfig, effectiveModel, fasterliveportraitConfig, hlsEndpoint, hlsToken, indexttsConfig.emotion_mode, indexttsEmotionAudioFile, isReferenceVideoMode, models, onExportCreated, onNotify, publishRtmps, qwenModel, qwenVoice, referenceDurationSec, knownOutputStatus, selectedAvatar, showIndexTTSEmotionStrength, showIndexTTSControls, text, title, ttsProvider, knownSourceStatus]);
 
   return (
     <main className="flex min-h-0 flex-1 flex-col bg-slate-100 p-4">
@@ -1239,6 +1269,7 @@ export function VideoCreationWorkspace({
                 <input
                   type="checkbox"
                   checked={publishRtmps}
+                  disabled={generating || !canStartVideoPublication(false, knownSourceStatus, knownOutputStatus)}
                   onChange={(event) => setPublishRtmps(event.target.checked)}
                   className="h-4 w-4 accent-orange-600"
                 />
@@ -1765,9 +1796,9 @@ export function VideoCreationWorkspace({
               </button>
               {result ? <span className="text-sm font-medium text-emerald-700">已保存到资产库</span> : null}
             </div>
-            {publishRtmps && (videoJobStatus || rtmpsJobStatus) ? (
+            {publicationControlsVisible(Boolean(publicationRunRef.current && publicationModeRef.current), Boolean(videoJobStatus), Boolean(rtmpsJobStatus)) ? (
               <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                {generating ? (
+                {generating || (videoJobStatus && !publicationTerminal(videoJobStatus.status)) || (rtmpsJobStatus && !publicationTerminal(rtmpsJobStatus.status)) ? (
                   <button type="button" onClick={() => void stopActiveVideoJobs()} className="mb-3 rounded-md border border-red-200 bg-white px-3 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-50">
                     停止生成与发布
                   </button>
@@ -1791,7 +1822,7 @@ export function VideoCreationWorkspace({
                 {rtmpsJobStatus?.last_error ? <p className="mt-2 text-red-700">错误：{rtmpsJobStatus.last_error}</p> : null}
               </div>
             ) : null}
-            {publishRtmps && (videoJobStatus || rtmpsJobStatus) ? (
+            {publicationControlsVisible(Boolean(publicationRunRef.current && publicationModeRef.current), Boolean(videoJobStatus), Boolean(rtmpsJobStatus)) ? (
               <section className="mt-4 rounded-lg border border-cyan-200 bg-cyan-50/60 p-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
