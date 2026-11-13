@@ -1,4 +1,4 @@
-export type PageKey = "home" | "docs" | "cases" | "about" | "caseDetail";
+export type PageKey = "home" | "docs" | "cases" | "donate" | "about" | "caseDetail";
 
 export type NavItem = {
   key: PageKey;
